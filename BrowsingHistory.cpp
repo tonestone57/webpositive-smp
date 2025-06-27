@@ -17,6 +17,9 @@
 #include <Path.h>
 
 #include "BrowserApp.h"
+#include <os/kernel/OS.h> // For spawn_thread, wait_for_thread, etc.
+#include <Looper.h>      // For BLooper
+#include <Handler.h>     // For BHandler
 
 
 BrowsingHistoryItem::BrowsingHistoryItem(const BString& url)
@@ -152,19 +155,37 @@ BrowsingHistory
 BrowsingHistory::sDefaultInstance;
 
 
+#include <AppDefs.h> // For be_app_messenger
+#include <MessageRunner.h> // For BMessageRunner
+
+const uint32 BrowsingHistory::MSG_HISTORY_LOADED; // Definition for static const
+const uint32 BrowsingHistory::MSG_DO_SAVE_HISTORY;
+
+
 BrowsingHistory::BrowsingHistory()
 	:
 	BLocker("browsing history"),
 	fHistoryItems(64),
 	fMaxHistoryItemAge(7),
-	fSettingsLoaded(false)
+	fSettingsLoaded(false),
+	fCompletionTarget(NULL),
+	fLoadThreadId(B_NO_THREAD),
+	fSaveRunner(NULL)
 {
 }
 
 
 BrowsingHistory::~BrowsingHistory()
 {
-	_SaveSettings();
+	if (fLoadThreadId >= B_NO_THREAD && fLoadThreadId != find_thread(NULL)) {
+		// Don't wait_for_thread if it's our own thread, can happen if
+		// app quits very early during history load.
+		status_t exitValue;
+		wait_for_thread(fLoadThreadId, &exitValue);
+	}
+	delete fSaveRunner;
+	fSaveRunner = NULL;
+	_PerformSave(); // Ensure any pending changes are written
 	_Clear();
 }
 
@@ -172,11 +193,57 @@ BrowsingHistory::~BrowsingHistory()
 /*static*/ BrowsingHistory*
 BrowsingHistory::DefaultInstance()
 {
-	if (sDefaultInstance.Lock()) {
-		sDefaultInstance._LoadSettings();
-		sDefaultInstance.Unlock();
-	}
+	// Loading is now handled by LoadAsync
 	return &sDefaultInstance;
+}
+
+
+/*static*/ int32
+BrowsingHistory::_LoadThreadEntry(void* data)
+{
+	BrowsingHistory* history = static_cast<BrowsingHistory*>(data);
+	if (history->Lock()) {
+		history->_LoadSettings();
+		BHandler* target = history->fCompletionTarget;
+		history->fLoadThreadId = B_NO_THREAD;
+		history->Unlock();
+
+		if (target && target->Looper()) {
+			BMessenger messenger(target);
+			messenger.SendMessage(MSG_HISTORY_LOADED);
+		}
+	}
+	return B_OK;
+}
+
+
+void
+BrowsingHistory::LoadAsync(BHandler* completionTarget)
+{
+	BAutolock _(this);
+	if (fSettingsLoaded || fLoadThreadId != B_NO_THREAD)
+		return;
+
+	fCompletionTarget = completionTarget;
+	fLoadThreadId = spawn_thread(_LoadThreadEntry, "history_load_thread",
+		B_NORMAL_PRIORITY, this);
+
+	if (fLoadThreadId < 0) {
+		// Thread spawning failed
+		fprintf(stderr, "Failed to spawn history loading thread!\n");
+		fLoadThreadId = B_NO_THREAD; // Reset
+		// Optionally, could fall back to synchronous loading or set an error state
+	}
+}
+
+
+bool
+BrowsingHistory::IsLoaded() const
+{
+	// This method should be called with the lock held or from the same thread
+	// if there's a possibility of fSettingsLoaded changing.
+	// For simplicity, we assume it's mostly checked from the UI thread.
+	return fSettingsLoaded;
 }
 
 
@@ -185,7 +252,85 @@ BrowsingHistory::AddItem(const BrowsingHistoryItem& item)
 {
 	BAutolock _(this);
 
-	return _AddItem(item, false);
+	// The actual AddItem logic
+	int32 count = CountItems(); // CountItems is lock-protected
+	int32 insertionIndex = count;
+	for (int32 i = 0; i < count; i++) {
+		BrowsingHistoryItem* existingItem
+			= reinterpret_cast<BrowsingHistoryItem*>(
+			fHistoryItems.ItemAtFast(i));
+		if (item.URL() == existingItem->URL()) {
+			if (!internal) { // 'internal' is true if called from _LoadSettings
+				existingItem->Invoked();
+				// ScheduleSave(); // Moved to the caller AddItem
+			}
+			return true; // Item already exists, updated if necessary
+		}
+		// This comparison logic might need review if BList isn't always sorted
+		// or if a different sort order is desired.
+		// Assuming items are added in a way that this check is meaningful
+		// or that BList maintains some order for AddItem(item, index).
+		// For now, keeping original logic for insertion point.
+		if (item < *existingItem)
+			insertionIndex = i;
+	}
+	BrowsingHistoryItem* newItem = new(std::nothrow) BrowsingHistoryItem(item);
+	if (!newItem || !fHistoryItems.AddItem(newItem, insertionIndex)) {
+		delete newItem;
+		return false; // Failed to add new item
+	}
+
+	if (!internal) { // 'internal' is true if called from _LoadSettings
+		newItem->Invoked(); // Update timestamp and count for new user-added item
+		// ScheduleSave(); // Moved to the caller AddItem
+	}
+
+	return true; // Item added successfully
+}
+
+
+// This is the public AddItem that schedules a save
+bool
+BrowsingHistory::AddItem(const BrowsingHistoryItem& item)
+{
+	BAutolock _(this);
+	bool result = _AddItem(item, false); // Call with internal = false
+	if (result)
+		ScheduleSave();
+	return result;
+}
+
+
+void
+BrowsingHistory::ScheduleSave()
+{
+	BAutolock _(this);
+	delete fSaveRunner;
+	fSaveRunner = NULL; // In case new fails
+	BMessage saveMsg(MSG_DO_SAVE_HISTORY);
+	// Target be_app, as BrowsingHistory is not a BHandler
+	fSaveRunner = new BMessageRunner(be_app_messenger, &saveMsg, 5 * 1000000, 1);
+	if (!fSaveRunner || fSaveRunner->InitCheck() != B_OK) {
+		delete fSaveRunner;
+		fSaveRunner = NULL;
+		fprintf(stderr, "Failed to schedule history save!\n");
+		// Fallback or error logging if BMessageRunner fails
+	}
+}
+
+
+void
+BrowsingHistory::SaveImmediatelyIfNeeded()
+{
+	BAutolock _(this);
+	// If a save was scheduled, cancel it and save now.
+	if (fSaveRunner) {
+		delete fSaveRunner;
+		fSaveRunner = NULL;
+		_PerformSave();
+	}
+	// If no save was scheduled, this does nothing, which is fine.
+	// _PerformSave() is also called in ~BrowsingHistory for final save.
 }
 
 
@@ -217,7 +362,7 @@ BrowsingHistory::Clear()
 {
 	BAutolock _(this);
 	_Clear();
-	_SaveSettings();
+	ScheduleSave();
 }	
 
 
@@ -227,7 +372,7 @@ BrowsingHistory::SetMaxHistoryItemAge(int32 days)
 	BAutolock _(this);
 	if (fMaxHistoryItemAge != days) {
 		fMaxHistoryItemAge = days;
-		_SaveSettings();
+		ScheduleSave();
 	}
 }	
 
@@ -322,7 +467,7 @@ BrowsingHistory::_LoadSettings()
 
 
 void
-BrowsingHistory::_SaveSettings()
+BrowsingHistory::_PerformSave()
 {
 	BFile settingsFile;
 	if (_OpenSettingsFile(settingsFile,

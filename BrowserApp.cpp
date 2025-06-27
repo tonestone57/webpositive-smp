@@ -300,7 +300,8 @@ BrowserApp::ReadyToRun()
 	if (pagesCreated == 0 || window == NULL)
 		_CreateNewWindow("", fullscreen);
 
-	PostMessage(PRELOAD_BROWSING_HISTORY);
+	// Asynchronously load browsing history
+	BrowsingHistory::DefaultInstance()->LoadAsync(this);
 }
 
 
@@ -308,10 +309,49 @@ void
 BrowserApp::MessageReceived(BMessage* message)
 {
 	switch (message->what) {
-	case PRELOAD_BROWSING_HISTORY:
-		// Accessing the default instance will load the history from disk.
-		BrowsingHistory::DefaultInstance();
+	case BrowsingHistory::MSG_HISTORY_LOADED:
+		// History is now loaded. Windows that are already open might want to
+		// refresh their history menus if they were opened before history loaded.
+		// For new windows, history will be available when they build their menus.
+		// Optional: could iterate windows and send them an update message.
+		printf("Browsing history loaded asynchronously.\n");
 		break;
+	case BrowsingHistory::MSG_DO_SAVE_HISTORY:
+		BrowsingHistory::DefaultInstance()->SaveImmediatelyIfNeeded();
+		break;
+	case MSG_APP_REQUEST_DOWNLOAD:
+	{
+		BString url;
+		BString suggestedFilename;
+		if (message->FindString("url", &url) == B_OK) {
+			message->FindString("suggested_filename", &suggestedFilename); // Optional
+			BrowserWindow* window = _FindWindowOnCurrentWorkspace();
+			if (window == NULL && CountWindows() > 0)
+				window = dynamic_cast<BrowserWindow*>(WindowAt(0));
+
+			if (window) {
+				BMessage triggerMsg(BrowserWindow::MSG_WINDOW_TRIGGER_DOWNLOAD);
+				triggerMsg.AddString("url", url);
+				if (suggestedFilename.Length() > 0)
+					triggerMsg.AddString("suggested_filename", suggestedFilename);
+				window->PostMessage(&triggerMsg);
+			} else {
+				// No window open, fall back to a more direct approach or alert.
+				// For now, try creating a new window context for the download.
+				// This is similar to the old behavior but more targeted.
+				// Ideally, WebKit would allow initiating a download without a visible page.
+				printf("No suitable window to restart download, creating new context.\n");
+				// This will create a window and load the URL, which should trigger download.
+				// The window might be blank and then get the download.
+				// It's still not perfect as it might leave a window open.
+				_CreateNewWindow(url, false);
+				// TODO: A better solution for no-window scenario is needed.
+				// Perhaps an alert: "Please open a browser window to restart download."
+				// and provide "Copy URL".
+			}
+		}
+		break;
+	}
 	case B_SILENT_RELAUNCH:
 		_CreateNewPage("");
 		break;
@@ -442,6 +482,9 @@ BrowserApp::QuitRequested()
 			}
 		}
 	}
+
+	// Ensure any pending history save is performed before quitting.
+	BrowsingHistory::DefaultInstance()->SaveImmediatelyIfNeeded();
 
 	BWebPage::ShutdownOnce();
 

@@ -55,6 +55,11 @@ private:
 class BrowsingHistory : public BLocker {
 public:
 	static	BrowsingHistory*	DefaultInstance();
+	static	const uint32		MSG_HISTORY_LOADED = 'HlDd';
+	static	const uint32		MSG_DO_SAVE_HISTORY = 'HdSf';
+
+			void				LoadAsync(BHandler* completionTarget = NULL);
+			bool				IsLoaded() const;
 
 			bool				AddItem(const BrowsingHistoryItem& item);
 
@@ -75,8 +80,14 @@ private:
 									bool invoke);
 
 			void				_LoadSettings();
-			void				_SaveSettings();
+			void				_PerformSave(); // Renamed from _SaveSettings
 			bool				_OpenSettingsFile(BFile& file, uint32 mode);
+
+	static	int32				_LoadThreadEntry(void* data);
+
+public: // Made public for BrowserApp to call
+			void				SaveImmediatelyIfNeeded();
+			void				ScheduleSave();
 
 private:
 			BList				fHistoryItems;
@@ -84,6 +95,9 @@ private:
 
 	static	BrowsingHistory		sDefaultInstance;
 			bool				fSettingsLoaded;
+			BHandler*			fCompletionTarget;
+			thread_id			fLoadThreadId;
+			BMessageRunner*		fSaveRunner;
 };
 
 

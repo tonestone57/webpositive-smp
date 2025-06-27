@@ -284,6 +284,21 @@ private:
 			BMenuItem*			fBookmarkBarMenuItem;
 			BookmarkBar*		fBookmarkBar;
 			BFilePanel*			fSavePanel;
+
+	// For asynchronous page source saving
+	struct PageSourceSaveData {
+		BMessenger target;
+		BString    sourceString;
+		BString    targetPath;
+		BString    originalUrl;
+	};
+	static int32 _SavePageSourceThreadEntry(void* data);
+
+public:
+	static const uint32 MSG_PAGE_SOURCE_SAVE_DONE = 'PsSd';
+	// Optional: static const uint32 MSG_PAGE_SOURCE_SAVE_FAILED = 'PsSf';
+	static const uint32 MSG_WINDOW_TRIGGER_DOWNLOAD = 'WtdL';
+
 };
 
 
