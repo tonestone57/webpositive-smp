@@ -20,6 +20,7 @@
 #include <Window.h>
 #include <Looper.h> // Required for BMessenger target in BMessageRunner if used, and general Looper context
 #include <AppDefs.h> // For B_OK
+#include <OS.h> // For thread_id, find_thread, spawn_thread, wait_for_thread, snooze
 
 #include "tracker_private.h"
 
@@ -31,6 +32,8 @@
 
 #undef B_TRANSLATION_CONTEXT // Ensure B_TRANSLATION_CONTEXT is not doubly defined
 #define B_TRANSLATION_CONTEXT "BookmarkBar"
+
+static const thread_id B_NO_THREAD = -1;
 
 const uint32 BookmarkBar::MSG_ADD_BOOKMARK_ITEMS;
 const uint32 BookmarkBar::MSG_BOOKMARKS_LOADED;
@@ -251,7 +254,7 @@ BookmarkBar::MessageReceived(BMessage* message)
 
 					BEntry entry(&ref);
 					if (entry.InitCheck() == B_OK)
-						_AddItem(inode, &entry);
+						_AddItem(inode, ref); // Pass the entry_ref directly
 					break;
 				}
 				case B_ENTRY_MOVED:
@@ -268,7 +271,10 @@ BookmarkBar::MessageReceived(BMessage* message)
 					BEntry followedEntry(&ref, true); // traverse in case it's a symlink
 
 					if (fItemsMap[inode] == NULL) {
-						_AddItem(inode, &entry);
+						// Pass the entry_ref directly
+						// Ensure BEntry 'entry' is initialized if used to get the ref,
+						// but 'ref' is already available.
+						_AddItem(inode, ref);
 						break;
 					} else {
 						// Existing item. Check if it's a rename or a move

@@ -17,9 +17,11 @@
 #include <Path.h>
 
 #include "BrowserApp.h"
-#include <os/kernel/OS.h> // For spawn_thread, wait_for_thread, etc.
+#include <os/kernel/OS.h> // For spawn_thread, wait_for_thread, thread_id, find_thread etc.
 #include <Looper.h>      // For BLooper
 #include <Handler.h>     // For BHandler
+
+static const thread_id B_NO_THREAD = -1;
 
 
 BrowsingHistoryItem::BrowsingHistoryItem(const BString& url)
@@ -247,48 +249,6 @@ BrowsingHistory::IsLoaded() const
 }
 
 
-bool
-BrowsingHistory::AddItem(const BrowsingHistoryItem& item)
-{
-	BAutolock _(this);
-
-	// The actual AddItem logic
-	int32 count = CountItems(); // CountItems is lock-protected
-	int32 insertionIndex = count;
-	for (int32 i = 0; i < count; i++) {
-		BrowsingHistoryItem* existingItem
-			= reinterpret_cast<BrowsingHistoryItem*>(
-			fHistoryItems.ItemAtFast(i));
-		if (item.URL() == existingItem->URL()) {
-			if (!internal) { // 'internal' is true if called from _LoadSettings
-				existingItem->Invoked();
-				// ScheduleSave(); // Moved to the caller AddItem
-			}
-			return true; // Item already exists, updated if necessary
-		}
-		// This comparison logic might need review if BList isn't always sorted
-		// or if a different sort order is desired.
-		// Assuming items are added in a way that this check is meaningful
-		// or that BList maintains some order for AddItem(item, index).
-		// For now, keeping original logic for insertion point.
-		if (item < *existingItem)
-			insertionIndex = i;
-	}
-	BrowsingHistoryItem* newItem = new(std::nothrow) BrowsingHistoryItem(item);
-	if (!newItem || !fHistoryItems.AddItem(newItem, insertionIndex)) {
-		delete newItem;
-		return false; // Failed to add new item
-	}
-
-	if (!internal) { // 'internal' is true if called from _LoadSettings
-		newItem->Invoked(); // Update timestamp and count for new user-added item
-		// ScheduleSave(); // Moved to the caller AddItem
-	}
-
-	return true; // Item added successfully
-}
-
-
 // This is the public AddItem that schedules a save
 bool
 BrowsingHistory::AddItem(const BrowsingHistoryItem& item)
@@ -412,7 +372,7 @@ BrowsingHistory::_AddItem(const BrowsingHistoryItem& item, bool internal)
 		if (item.URL() == existingItem->URL()) {
 			if (!internal) {
 				existingItem->Invoked();
-				_SaveSettings();
+				// Saving is handled by the public AddItem via ScheduleSave()
 			}
 			return true;
 		}
@@ -427,7 +387,7 @@ BrowsingHistory::_AddItem(const BrowsingHistoryItem& item, bool internal)
 
 	if (!internal) {
 		newItem->Invoked();
-		_SaveSettings();
+		// Saving is handled by the public AddItem via ScheduleSave()
 	}
 
 	return true;
