@@ -1232,10 +1232,6 @@ BrowserWindow::MessageReceived(BMessage* message)
 			}
 		}
 
-		default:
-			BWebWindow::MessageReceived(message);
-			break;
-
 		case MSG_PAGE_SOURCE_SAVE_DONE:
 		{
 			entry_ref ref;
@@ -1278,10 +1274,6 @@ BrowserWindow::MessageReceived(BMessage* message)
 			break;
 		}
 
-		default:
-			BWebWindow::MessageReceived(message);
-			break;
-
 		case MSG_WINDOW_TRIGGER_DOWNLOAD:
 		{
 			BString url;
@@ -1308,7 +1300,7 @@ BrowserWindow::MessageReceived(BMessage* message)
 			BWebWindow::MessageReceived(message);
 			break;
 	}
-	}
+}
 
 
 /*static*/ int32

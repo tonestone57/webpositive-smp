@@ -9,6 +9,8 @@
 #include "DateTime.h"
 #include <List.h>
 #include <Locker.h>
+#include <Handler.h>      // For BHandler
+#include <MessageRunner.h> // For BMessageRunner
 
 class BFile;
 class BString;

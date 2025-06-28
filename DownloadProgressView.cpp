@@ -32,6 +32,7 @@
 #include <StringView.h>
 #include <TimeFormat.h>
 
+#include "BrowserApp.h" // For MSG_APP_REQUEST_DOWNLOAD
 #include "BrowserWindow.h"
 #include "WebDownload.h"
 #include "WebPage.h"

@@ -46,6 +46,8 @@ class SettingsWindow;
 
 class BrowserApp : public BApplication {
 public:
+	static const uint32			MSG_APP_REQUEST_DOWNLOAD = 'ArDl';
+
 								BrowserApp();
 	virtual						~BrowserApp();
 
