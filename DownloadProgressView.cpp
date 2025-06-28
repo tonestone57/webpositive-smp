@@ -426,7 +426,7 @@ DownloadProgressView::MessageReceived(BMessage* message)
 		}
 		case RESTART_DOWNLOAD:
 		{
-			BMessage request(MSG_APP_REQUEST_DOWNLOAD);
+			BMessage request(BrowserApp::MSG_APP_REQUEST_DOWNLOAD);
 			request.AddString("url", fURL);
 			if (fPath.InitCheck() == B_OK)
 				request.AddString("suggested_filename", fPath.Leaf());
