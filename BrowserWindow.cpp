@@ -92,8 +92,12 @@
 #include "WindowIcon.h"
 
 
-#undef B_TRANSLATION_CONTEXT
+#undef B_TRANSLATION_CONTEXT // Ensure B_TRANSLATION_CONTEXT is not doubly defined
 #define B_TRANSLATION_CONTEXT "WebPositive Window"
+
+// Define static consts if not already defined through other means
+const uint32 BrowserWindow::MSG_PAGE_SOURCE_SAVE_DONE;
+const uint32 BrowserWindow::MSG_WINDOW_TRIGGER_DOWNLOAD;
 
 
 enum {
@@ -1231,7 +1235,134 @@ BrowserWindow::MessageReceived(BMessage* message)
 		default:
 			BWebWindow::MessageReceived(message);
 			break;
+
+		case MSG_PAGE_SOURCE_SAVE_DONE:
+		{
+			entry_ref ref;
+			status_t status = B_OK; // Assume OK unless error string is present
+			BString error;
+
+			if (message->FindString("error", &error) == B_OK) {
+				status = B_ERROR; // Mark as error if error string found
+				BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+					error, B_TRANSLATE("OK"));
+				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+				alert->Go(NULL);
+			} else if (message->FindRef("ref", &ref) == B_OK) {
+				BMessage refsMessage(B_REFS_RECEIVED);
+				status_t addRefStatus = refsMessage.AddRef("refs", &ref);
+				if (addRefStatus == B_OK) {
+					status_t launchStatus = be_roster->Launch("text/x-source-code", &refsMessage);
+					if (launchStatus == B_ALREADY_RUNNING)
+						launchStatus = B_OK; // Not an error
+					if (launchStatus != B_OK)
+						status = launchStatus; // Propagate launch error
+				} else {
+					status = addRefStatus; // Propagate AddRef error
+				}
+			} else {
+				// Neither error nor ref found, something is wrong with the message
+				status = B_BAD_VALUE;
+			}
+
+			if (status != B_OK && error.IsEmpty()) {
+				// Generic error if no specific one was reported but an operation failed
+				char buffer[1024];
+				snprintf(buffer, sizeof(buffer), B_TRANSLATE("Failed to show the "
+					"page source: %s\n"), strerror(status));
+				BAlert* alert = new BAlert(B_TRANSLATE("Page source error"), buffer,
+					B_TRANSLATE("OK"));
+				alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+				alert->Go(NULL);
+			}
+			break;
+		}
+
+		default:
+			BWebWindow::MessageReceived(message);
+			break;
+
+		case MSG_WINDOW_TRIGGER_DOWNLOAD:
+		{
+			BString url;
+			if (message->FindString("url", &url) == B_OK) {
+				// BString suggestedFilename; // Not directly used by LoadURL
+				// message->FindString("suggested_filename", &suggestedFilename);
+				if (CurrentWebView()) {
+					CurrentWebView()->LoadURL(url);
+				} else {
+					// This window has no current WebView to initiate the load.
+					// This case should ideally be handled by BrowserApp finding a suitable window.
+					// Or, the app could create a new minimal window if none are suitable.
+					fprintf(stderr, "BrowserWindow received MSG_WINDOW_TRIGGER_DOWNLOAD but has no CurrentWebView. Cannot restart download in this window.\n");
+					BAlert* alert = new BAlert(B_TRANSLATE("Download Restart Error"),
+						B_TRANSLATE("Cannot restart download: the selected window has no active tab. Please try opening a new tab or window."),
+						B_TRANSLATE("OK"));
+					alert->Go();
+				}
+			}
+			break;
+		}
+
+		default:
+			BWebWindow::MessageReceived(message);
+			break;
 	}
+	}
+
+
+/*static*/ int32
+BrowserWindow::_SavePageSourceThreadEntry(void* data)
+{
+	PageSourceSaveData* saveData = static_cast<PageSourceSaveData*>(data);
+	BMessage reply(MSG_PAGE_SOURCE_SAVE_DONE);
+	status_t FStatus = B_OK; // Final status for this operation
+
+	BFile pageSourceFile(saveData->targetPath.String(),
+		B_CREATE_FILE | B_ERASE_FILE | B_WRITE_ONLY);
+	FStatus = pageSourceFile.InitCheck();
+
+	if (FStatus == B_OK) {
+		ssize_t written = pageSourceFile.Write(saveData->sourceString.String(),
+			saveData->sourceString.Length());
+		if (written < 0)
+			FStatus = written; // Error code
+		else if (written != (ssize_t)saveData->sourceString.Length())
+			FStatus = B_IO_ERROR; // Short write
+	}
+
+	if (FStatus == B_OK) {
+		const char* type = "text/html";
+		// A very basic type detection for SVG, otherwise default to HTML
+		if (saveData->originalUrl.EndsWith(".svg", false)
+			|| saveData->originalUrl.EndsWith(".svgz", false)
+			|| saveData->sourceString.FindFirst("<svg") != B_ERROR) {
+			// Checking content might be slow for large strings, URL check is safer
+			type = "image/svg+xml";
+		}
+		// It's important to include the null terminator in attribute length for strings
+		pageSourceFile.WriteAttr("BEOS:TYPE", B_STRING_TYPE, 0, type, strlen(type) + 1);
+		// Failure to write attribute is not considered a fatal error for this operation
+	}
+
+	if (FStatus == B_OK) {
+		entry_ref sourceFileRef;
+		FStatus = get_ref_for_path(saveData->targetPath.String(), &sourceFileRef);
+		if (FStatus == B_OK)
+			reply.AddRef("ref", &sourceFileRef);
+	}
+
+	if (FStatus != B_OK) {
+		BString errorMessage;
+		errorMessage.SetToFormat(B_TRANSLATE("Could not save page source to temporary file %s: %s"),
+			saveData->targetPath.String(), strerror(FStatus));
+		reply.AddString("error", errorMessage.String());
+	}
+
+	// Always send a reply, even on error, so the main thread knows.
+	saveData->target.SendMessage(&reply);
+	delete saveData; // Clean up the data structure
+	return B_OK;
 }
 
 
@@ -1903,10 +2034,26 @@ BrowserWindow::_ShutdownTab(int32 index)
 	BWebView* webView = dynamic_cast<BWebView*>(view);
 	if (webView == CurrentWebView())
 		SetCurrentWebView(NULL);
-	if (webView != NULL)
+
+	if (webView != NULL) {
+		// Clean up PageUserData if BWebView doesn't own it
+		PageUserData* userData = static_cast<PageUserData*>(webView->GetUserData());
+		if (userData) {
+			webView->SetUserData(NULL); // Disassociate
+			delete userData;
+		}
 		webView->Shutdown();
-	else
+		// If the webView was not the CurrentWebView, it might not be deleted
+		// by the TabManager or window closure logic immediately if it's not
+		// part of the view hierarchy anymore. However, BWebWindow's destructor
+		// or TabManager should handle deleting the BWebView* itself.
+		// If 'view' is different from 'webView' (should not happen if cast is successful)
+		// or if webView was not owned by TabManager, explicit deletion might be needed.
+		// For now, assuming TabManager or BWebWindow handles BWebView deletion.
+	} else {
+		// If it's not a BWebView, but some other BView, delete it.
 		delete view;
+	}
 }
 
 
@@ -2137,7 +2284,10 @@ BrowserWindow::_CreateBookmark()
 
 	if (status == B_OK)
 		_CreateBookmark(path, fileName, title, url, miniIcon, largeIcon);
-	else {
+
+	delete miniIcon; // Clean up the created miniIcon after use
+
+	if (status != B_OK) {
 		BString message(B_TRANSLATE_COMMENT("There was an error retrieving "
 			"the bookmark folder.\n\nError: %error", "Don't translate the "
 			"variable %error"));
@@ -2297,9 +2447,23 @@ BrowserWindow::_UpdateHistoryMenu()
 		delete menuItem;
 
 	BrowsingHistory* history = BrowsingHistory::DefaultInstance();
+	// Check if history is loaded and then try to lock.
+	// If not loaded, the menu will be empty or show a 'loading' state.
+	if (!history->IsLoaded()) {
+		// Optionally, add a placeholder item like "History loading..."
+		// For now, just show an empty history section if not loaded.
+		// Ensure the "Clear history" item is disabled too.
+		BMenuItem* clearHistoryItem = new BMenuItem(B_TRANSLATE("Clear history"),
+			new BMessage(CLEAR_HISTORY));
+		clearHistoryItem->SetEnabled(false);
+		fHistoryMenu->AddItem(clearHistoryItem);
+		return;
+	}
+
 	if (!history->Lock())
 		return;
 
+	// History is loaded and locked
 	int32 count = history->CountItems();
 	BMenuItem* clearHistoryItem = new BMenuItem(B_TRANSLATE("Clear history"),
 		new BMessage(CLEAR_HISTORY));
@@ -2739,74 +2903,111 @@ BrowserWindow::_SmartURLHandler(const BString& url)
 void
 BrowserWindow::_HandlePageSourceResult(const BMessage* message)
 {
-	// TODO: This should be done in an extra thread perhaps. Doing it in
-	// the application thread is not much better, since it actually draws
-	// the pages...
-
-	BPath pathToPageSource;
-
-	BString url;
-	status_t ret = message->FindString("url", &url);
-	if (ret == B_OK && url.FindFirst("file://") == 0) {
-		// Local file
-		url.Remove(0, strlen("file://"));
-		pathToPageSource.SetTo(url.String());
-	} else {
-		// Something else, store it.
-		// TODO: What if it isn't HTML, but for example SVG?
-		BString source;
-		ret = message->FindString("source", &source);
-
-		if (ret == B_OK)
-			ret = find_directory(B_SYSTEM_TEMP_DIRECTORY, &pathToPageSource);
-
-		BString tmpFileName("PageSource_");
-		tmpFileName << system_time() << ".html";
-		if (ret == B_OK)
-			ret = pathToPageSource.Append(tmpFileName.String());
-
-		BFile pageSourceFile(pathToPageSource.Path(),
-			B_CREATE_FILE | B_ERASE_FILE | B_WRITE_ONLY);
-		if (ret == B_OK)
-			ret = pageSourceFile.InitCheck();
-
-		if (ret == B_OK) {
-			ssize_t written = pageSourceFile.Write(source.String(),
-				source.Length());
-			if (written != source.Length())
-				ret = (status_t)written;
-		}
-
-		if (ret == B_OK) {
-			const char* type = "text/html";
-			size_t size = strlen(type);
-			pageSourceFile.WriteAttr("BEOS:TYPE", B_STRING_TYPE, 0, type, size);
-				// If it fails we don't care.
-		}
-	}
-
-	entry_ref ref;
-	if (ret == B_OK)
-		ret = get_ref_for_path(pathToPageSource.Path(), &ref);
-
-	if (ret == B_OK) {
-		BMessage refsMessage(B_REFS_RECEIVED);
-		ret = refsMessage.AddRef("refs", &ref);
-		if (ret == B_OK) {
-			ret = be_roster->Launch("text/x-source-code", &refsMessage);
-			if (ret == B_ALREADY_RUNNING)
-				ret = B_OK;
-		}
-	}
-
-	if (ret != B_OK) {
-		char buffer[1024];
-		snprintf(buffer, sizeof(buffer), "Failed to show the "
-			"page source: %s\n", strerror(ret));
-		BAlert* alert = new BAlert(B_TRANSLATE("Page source error"), buffer,
+	BString originalUrl;
+	status_t status = message->FindString("url", &originalUrl);
+	if (status != B_OK) {
+		BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+			B_TRANSLATE("Could not determine URL for page source."),
 			B_TRANSLATE("OK"));
 		alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
 		alert->Go(NULL);
+		return;
+	}
+
+	if (originalUrl.FindFirst("file://") == 0) {
+		// Local file, handle directly (no threading needed for this part)
+		BPath pathToPageSource;
+		originalUrl.Remove(0, strlen("file://"));
+		pathToPageSource.SetTo(originalUrl.String());
+		entry_ref ref;
+		status = get_ref_for_path(pathToPageSource.Path(), &ref);
+		if (status == B_OK) {
+			BMessage refsMessage(B_REFS_RECEIVED);
+			status = refsMessage.AddRef("refs", &ref);
+			if (status == B_OK) {
+				status = be_roster->Launch("text/x-source-code", &refsMessage);
+				if (status == B_ALREADY_RUNNING)
+					status = B_OK;
+			}
+		}
+		if (status != B_OK) {
+			char buffer[1024];
+			snprintf(buffer, sizeof(buffer), B_TRANSLATE("Failed to show the "
+				"page source for %s: %s\n"), originalUrl.String(), strerror(status));
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"), buffer,
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+		}
+	} else {
+		// Remote content, needs saving to a temp file asynchronously
+		BString sourceString;
+		status = message->FindString("source", &sourceString);
+		if (status != B_OK) {
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+				B_TRANSLATE("Could not retrieve page source content."),
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+			return;
+		}
+
+		BPath tempPath;
+		status = find_directory(B_SYSTEM_TEMP_DIRECTORY, &tempPath);
+		if (status != B_OK) {
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+				B_TRANSLATE("Could not find temporary directory."),
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+			return;
+		}
+
+		BString tmpFileName("PageSource_");
+		tmpFileName << system_time() << ".html"; // Default to .html
+		// A more robust way to get a good extension might be needed for other types.
+		if (originalUrl.EndsWith(".svg", false) || originalUrl.EndsWith(".svgz", false))
+			tmpFileName.ReplaceLast(".html", ".svg");
+
+
+		status = tempPath.Append(tmpFileName.String());
+		if (status != B_OK) {
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+				B_TRANSLATE("Could not construct temporary file path."),
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+			return;
+		}
+
+		PageSourceSaveData* saveData = new(std::nothrow) PageSourceSaveData;
+		if (!saveData) {
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+				B_TRANSLATE("Out of memory for page source operation."),
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+			return;
+		}
+
+		saveData->target = BMessenger(this);
+		saveData->sourceString = sourceString;
+		saveData->targetPath = tempPath.Path();
+		saveData->originalUrl = originalUrl;
+
+		thread_id saverThread = spawn_thread(_SavePageSourceThreadEntry,
+			"save_page_source_thread", B_NORMAL_PRIORITY, saveData);
+
+		if (saverThread < 0) {
+			fprintf(stderr, "Failed to spawn page source saving thread!\n");
+			delete saveData;
+			BAlert* alert = new BAlert(B_TRANSLATE("Page source error"),
+				B_TRANSLATE("Could not start background saving operation."),
+				B_TRANSLATE("OK"));
+			alert->SetFlags(alert->Flags() | B_CLOSE_ON_ESCAPE);
+			alert->Go(NULL);
+		}
+		// Thread will send MSG_PAGE_SOURCE_SAVE_DONE on completion or error
 	}
 }
 

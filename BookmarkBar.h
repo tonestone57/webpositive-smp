@@ -37,7 +37,10 @@ public:
 
 	void 							MouseDown(BPoint where);
 private:
-	void							_AddItem(ino_t inode, BEntry* entry);
+	void							_AddItem(ino_t inode, const entry_ref& ref); // Modified to take entry_ref
+
+private:
+	static int32					_LoadBookmarksThreadEntry(void* data);
 
 private:
 	node_ref						fNodeRef;
@@ -47,6 +50,11 @@ private:
 	bool							fOverflowMenuAdded;
 	BPopUpMenu*						fPopUpMenu;
 	int32 							fSelectedItemIndex;
+	thread_id						fLoadThreadId;
+
+public:
+	static const uint32				MSG_ADD_BOOKMARK_ITEMS = 'AbMi';
+	static const uint32				MSG_BOOKMARKS_LOADED = 'BmLd';
 };
 
 

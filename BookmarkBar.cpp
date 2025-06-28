@@ -18,6 +18,8 @@
 #include <PromptWindow.h>
 #include <TextControl.h>
 #include <Window.h>
+#include <Looper.h> // Required for BMessenger target in BMessageRunner if used, and general Looper context
+#include <AppDefs.h> // For B_OK
 
 #include "tracker_private.h"
 
@@ -27,7 +29,11 @@
 #include <stdio.h>
 
 
+#undef B_TRANSLATION_CONTEXT // Ensure B_TRANSLATION_CONTEXT is not doubly defined
 #define B_TRANSLATION_CONTEXT "BookmarkBar"
+
+const uint32 BookmarkBar::MSG_ADD_BOOKMARK_ITEMS;
+const uint32 BookmarkBar::MSG_BOOKMARKS_LOADED;
 
 const uint32 kOpenNewTabMsg = 'opnt';
 const uint32 kDeleteMsg = 'dele';
@@ -40,13 +46,20 @@ const uint32 kFolderMsg = 'fold';
 BookmarkBar::BookmarkBar(const char* title, BHandler* target,
 	const entry_ref* navDir)
 	:
-	BMenuBar(title)
+	BMenuBar(title),
+	fNodeRef(), // Initialize properly
+	fOverflowMenu(NULL),
+	fOverflowMenuAdded(false),
+	fPopUpMenu(NULL),
+	fSelectedItemIndex(-1),
+	fLoadThreadId(B_NO_THREAD)
 {
 	SetFlags(Flags() | B_FRAME_EVENTS);
-	BEntry(navDir).GetNodeRef(&fNodeRef);
+	if (navDir)
+		BEntry(navDir).GetNodeRef(&fNodeRef);
 
 	fOverflowMenu = new BMenu(B_UTF8_ELLIPSIS);
-	fOverflowMenuAdded = false;
+	// fOverflowMenuAdded is false by default
 
 	fPopUpMenu = new BPopUpMenu("Bookmark Popup", false, false);
 	fPopUpMenu->AddItem(
@@ -62,9 +75,23 @@ BookmarkBar::BookmarkBar(const char* title, BHandler* target,
 BookmarkBar::~BookmarkBar()
 {
 	stop_watching(BMessenger(this));
+	if (fLoadThreadId != B_NO_THREAD && fLoadThreadId != find_thread(NULL)) {
+		// Check against B_NO_THREAD which is -1, or specific positive thread IDs.
+		status_t exit_val;
+		wait_for_thread(fLoadThreadId, &exit_val);
+	}
+	// fOverflowMenu is owned by BMenuBar if added, otherwise needs deletion.
 	if (!fOverflowMenuAdded)
 		delete fOverflowMenu;
+	else {
+		// If it was added, BMenuBar owns it. But if it might be manipulated
+		// after this point, ensure it's cleaned from fItemsMap if necessary.
+		// However, fItemsMap refers to items *within* menus, not the menu itself.
+	}
 	delete fPopUpMenu;
+	// IconMenuItems in fItemsMap are owned by the BMenu they are added to.
+	// BMenuBar's destructor will delete its items, which in turn delete submenus.
+	fItemsMap.clear();
 }
 
 
@@ -115,14 +142,62 @@ BookmarkBar::AttachedToWindow()
 	BMenuBar::AttachedToWindow();
 	watch_node(&fNodeRef, B_WATCH_DIRECTORY, BMessenger(this));
 
-	// Enumerate initial directory content
-	BDirectory dir(&fNodeRef);
-	BEntry bookmark;
-	while (dir.GetNextEntry(&bookmark, false) == B_OK) {
-		node_ref ref;
-		if (bookmark.GetNodeRef(&ref) == B_OK)
-			_AddItem(ref.node, &bookmark);
+	// Asynchronously load initial directory content
+	fLoadThreadId = spawn_thread(_LoadBookmarksThreadEntry,
+		"bookmark_load_thread", B_NORMAL_PRIORITY, this);
+
+	if (fLoadThreadId < 0) {
+		fprintf(stderr, "Failed to spawn bookmark loading thread!\n");
+		fLoadThreadId = B_NO_THREAD;
+		// Fallback: could load synchronously or leave bar empty
 	}
+}
+
+
+/*static*/ int32
+BookmarkBar::_LoadBookmarksThreadEntry(void* data)
+{
+	BookmarkBar* bar = static_cast<BookmarkBar*>(data);
+	BDirectory dir(&bar->fNodeRef);
+	if (dir.InitCheck() != B_OK) {
+		bar->fLoadThreadId = B_NO_THREAD;
+		return B_ERROR;
+	}
+
+	BEntry entry;
+	BMessage batchMessage(MSG_ADD_BOOKMARK_ITEMS);
+	int32 itemsInBatch = 0;
+	const int32 BATCH_SIZE = 10; // Send items in batches
+
+	while (dir.GetNextEntry(&entry, false) == B_OK) {
+		if (!entry.IsFile() && !entry.IsDirectory() && !entry.IsSymLink())
+			continue;
+
+		entry_ref ref;
+		node_ref nref; // For inode
+		if (entry.GetRef(&ref) == B_OK && entry.GetNodeRef(&nref) == B_OK) {
+			batchMessage.AddInt64("node", nref.node);
+			batchMessage.AddRef("refs", &ref);
+			itemsInBatch++;
+
+			if (itemsInBatch >= BATCH_SIZE) {
+				BMessenger(bar).SendMessage(&batchMessage);
+				batchMessage.MakeEmpty(); // Prepare for next batch
+				batchMessage.what = MSG_ADD_BOOKMARK_ITEMS;
+				itemsInBatch = 0;
+				// Yield for a moment to allow UI to process
+				snooze(20000); // 20ms
+			}
+		}
+	}
+
+	if (itemsInBatch > 0) {
+		BMessenger(bar).SendMessage(&batchMessage);
+	}
+
+	BMessenger(bar).SendMessage(MSG_BOOKMARKS_LOADED);
+	bar->fLoadThreadId = B_NO_THREAD;
+	return B_OK;
 }
 
 
@@ -130,8 +205,37 @@ void
 BookmarkBar::MessageReceived(BMessage* message)
 {
 	switch (message->what) {
+		case MSG_ADD_BOOKMARK_ITEMS:
+		{
+			entry_ref ref;
+			int64 node;
+			for (int32 i = 0; message->FindRef("refs", i, &ref) == B_OK
+				&& message->FindInt64("node", i, &node) == B_OK; i++) {
+				_AddItem(node, ref);
+			}
+			// Reevaluate whether the "more" menu is needed after adding items
+			BRect rect = Bounds();
+			FrameResized(rect.Width(), rect.Height());
+			break;
+		}
+		case MSG_BOOKMARKS_LOADED:
+		{
+			// Optional: any final actions after all bookmarks are loaded.
+			// For example, ensure FrameResized is called one last time.
+			BRect rect = Bounds();
+			FrameResized(rect.Width(), rect.Height());
+			printf("Bookmarks loaded.\n");
+			break;
+		}
 		case B_NODE_MONITOR:
 		{
+			// If still loading, node monitor events might conflict or be redundant.
+			// However, node monitoring is essential for live updates after initial load.
+			// For simplicity, let it run. If initial load is slow, user actions
+			// (like deleting a bookmark being loaded) could have race conditions.
+			// A robust solution might queue node monitor events during initial load
+			// or disable/re-enable monitoring. For now, proceed with direct handling.
+
 			int32 opcode = message->FindInt32("opcode");
 			ino_t inode = message->FindInt64("node");
 			switch (opcode) {
@@ -429,36 +533,43 @@ BookmarkBar::MinSize()
 
 
 void
-BookmarkBar::_AddItem(ino_t inode, BEntry* entry)
+BookmarkBar::_AddItem(ino_t inode, const entry_ref& ref)
 {
-	char name[B_FILE_NAME_LENGTH];
-	entry->GetName(name);
-
-	// make sure the item doesn't already exists
-	if (fItemsMap[inode] != NULL)
+	// make sure the item doesn't already exist in the map by inode
+	if (fItemsMap.count(inode)) // Use .count for std::map
 		return;
 
-	entry_ref ref;
-	entry->GetRef(&ref);
+	BEntry entry(&ref, false); // Don't traverse symlinks for GetName
+	if (entry.InitCheck() != B_OK)
+		return;
 
-	// In case it's a symlink, follow link to get the right icon,
-	// but add the symlink's entry_ref for the IconMenuItem so it gets renamed/deleted/etc.
-	BEntry followedLink(&ref, true); // traverse link
+	char name[B_FILE_NAME_LENGTH];
+	entry.GetName(name);
+
+	// In case it's a symlink, follow link to get the right icon for display,
+	// but the message should operate on the symlink itself (using the passed 'ref').
+	BEntry followedEntry(&ref, true); // Traverse link for icon and type check
 
 	IconMenuItem* item = NULL;
 
-	if (followedLink.IsDirectory()) {
+	if (followedEntry.IsDirectory()) {
 		BNavMenu* menu = new BNavMenu(name, B_REFS_RECEIVED, Window());
-		menu->SetNavDir(&ref);
-		BMessage* message = new BMessage(kFolderMsg);
-		message->AddRef("refs", &ref);
-		item = new IconMenuItem(menu, message, "application/x-vnd.Be-directory", B_MINI_ICON);
+		// It's crucial that SetNavDir uses the original ref if it's a symlink
+		// to a directory, or the followed ref if that's the desired behavior.
+		// Current BNavMenu likely expects a real directory.
+		// For simplicity, let's assume we always want to navigate the target for directories.
+		entry_ref targetRef;
+		followedEntry.GetRef(&targetRef);
+		menu->SetNavDir(&targetRef);
 
+		BMessage* message = new BMessage(kFolderMsg);
+		message->AddRef("refs", &ref); // Message uses original ref
+		item = new IconMenuItem(menu, message, "application/x-vnd.Be-directory", B_MINI_ICON);
 	} else {
-		BNode node(&followedLink);
+		BNode node(&followedEntry); // Use followed entry for icon
 		BNodeInfo info(&node);
 		BMessage* message = new BMessage(B_REFS_RECEIVED);
-		message->AddRef("refs", &ref);
+		message->AddRef("refs", &ref); // Message uses original ref
 		item = new IconMenuItem(name, message, &info, B_MINI_ICON);
 	}
 
